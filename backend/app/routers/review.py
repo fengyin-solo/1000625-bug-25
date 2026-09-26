@@ -6,14 +6,14 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 
 from app.schemas import ActionResult, EntryPayload, PageResult
-from app.services.review import ReviewService
+from app.services.review import STATUS_ORDER, ReviewVersionConflict, ReviewService
 
 router = APIRouter(prefix="/api/review", tags=["结果复核"])
 
 service = ReviewService()
 
 LIST_FIELDS = ["复核编号", "关联结果", "复核项目", "复核人", "复核意见", "复核时间", "差异说明", "复核状态"]
-STATUSES = ["待复核", "复核中", "已通过", "需重测"]
+STATUSES = STATUS_ORDER
 
 
 @router.get("", response_model=PageResult[dict])
@@ -24,10 +24,30 @@ def list_entries(
     size: int = 20,
 ) -> PageResult[dict]:
     """按复核编号与状态过滤结果复核列表；没有数据时返回空页，不报错。"""
+    if page < 1 or size < 1:
+        raise HTTPException(status_code=400, detail="页码与每页条数必须为正整数")
     if size > 200:
         raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
+    if status is not None and status not in STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"复核状态只支持：{'、'.join(STATUSES)}",
+        )
     items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
     return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.get("/stats")
+def review_stats() -> dict[str, int]:
+    """复核看板统计：状态口径与列表、详情保持一致。"""
+    return service.stats()
+
+
+@router.get("/export")
+def export_entries() -> dict[str, Any]:
+    """导出结果复核清单：返回当前过滤条件下的全量数据。"""
+    items, total = service.list_entries(page=1, size=10000)
+    return {"module": "review", "total": total, "items": items}
 
 
 @router.get("/{entry_id}", response_model=dict)
@@ -50,16 +70,26 @@ def create_entry(payload: EntryPayload) -> ActionResult:
 
 @router.post("/{entry_id}/actions", response_model=ActionResult)
 def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
-    """对单条复核记录执行开始复核、确认通过、发起重测；不允许的动作会被拦下并说明原因。"""
+    """对单条复核记录执行开始复核、确认通过、发起重测；不允许的动作会被拦下并说明原因。
+
+    校验顺序：并发版本 → 状态流转 → 必填意见/差异说明，任何一步失败都返回可读原因，
+    并发冲突用 409 让前端提示刷新并重试，而不是让后提交的人静默覆盖前一人。
+    """
     action = str(payload.values.get("action") or "").strip()
-    entry, message = service.run_action(entry_id, action)
+    expected_version_raw = payload.values.get("expected_version")
+    try:
+        expected_version = int(expected_version_raw) if expected_version_raw is not None else None
+    except (TypeError, ValueError):
+        expected_version = None
+    try:
+        entry, message = service.run_action(
+            entry_id,
+            action,
+            values=payload.values,
+            expected_version=expected_version,
+        )
+    except ReviewVersionConflict as conflict:
+        raise HTTPException(status_code=409, detail=str(conflict)) from conflict
     if entry is None:
         return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=message, entry=entry)
-
-
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出结果复核清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "review", "total": total, "items": items}
